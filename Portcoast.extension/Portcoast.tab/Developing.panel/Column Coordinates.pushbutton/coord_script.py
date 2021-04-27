@@ -1,4 +1,7 @@
+__title__ = "Add Coordinate Values"
+
 try:
+    import System
     import os
     import math
     import clr
@@ -11,91 +14,71 @@ try:
     import pyrevit
     from pyrevit import DB, UI
 
+    from datetime import datetime
+    
     uidoc = __revit__.ActiveUIDocument
     doc = uidoc.Document
     app = __revit__.Application
     
-    # Get All Selected ElementIDs
-    selected_ElementIDs = uidoc.Selection.GetElementIds()
-    
-    # Get All Selected Elements
-    selected_Elements = map(lambda x: doc.GetElement(x), selected_ElementIDs)
-    
+    selected_Elements = map(lambda x: doc.GetElement(x), uidoc.Selection.GetElementIds())
     # Filter to get Structural Columns
     piles_list = list(filter(lambda x: x.Category.Name == "Structural Columns", selected_Elements))
-    points_list = []
-    angle_list = []
-    for i in piles_list:
-        location_point = i.Location.Point
-        
-        # Points List
-        points_list.append(location_point)
-        
-        # Angles List
-        y = location_point.Y
-        angle = i.Location.Point.AngleTo(XYZ(1,0,0))
-        if y>0:
-            angle_list.append(angle)
-        else:
-            angle_list.append(2*math.pi-angle)
     
     # Get Project Base Point
     project_base_point = FilteredElementCollector(doc).OfCategory(OST_ProjectBasePoint).ToElements()[0]
-    y0 = project_base_point.GetParameters("N/S")[0].AsDouble()
-    x0 = project_base_point.GetParameters("E/W")[0].AsDouble()
-    a0 = project_base_point.GetParameters("Angle to True North")[0].AsDouble()
-
-    # Get Lengths
-    lengths = map(lambda x: x.GetLength(), points_list)
-
-    # New Angles List
-    new_angles_list = map(lambda a1 : a1 - a0 +(a0//math.pi)*2*math.pi, angle_list)
+    a0 = -1*project_base_point.GetParameters("Angle to True North")[0].AsDouble()
+    
+    shared_base_point = FilteredElementCollector(doc).OfCategory(OST_SharedBasePoint).ToElements()[0]
+    y_survey_global = shared_base_point.GetParameters("N/S")[0].AsDouble()
+    x_survey_global = shared_base_point.GetParameters("E/W")[0].AsDouble()
+    vec_survey_global = XYZ(x_survey_global, y_survey_global, 0)
+    survey_vec_negate = shared_base_point.Position.Negate()
 
     # New Coords
-    x_list = []
-    y_list = []
-    for i in range(len(points_list)):
-        x = (lengths[i] * math.cos(new_angles_list[i]) + x0)
-        y = (lengths[i] * math.sin(new_angles_list[i]) + y0)
-        x_list.append(x)
-        y_list.append(y)
-    # New Definitions
- 
-    x_defi_options = ExternalDefinitionCreationOptions("X", ParameterType.Length)
-    x_defi_options.UserModifiable = False
- 
-    y_defi_options = ExternalDefinitionCreationOptions("Y", ParameterType.Length)
-    y_defi_options.UserModifiable = False
-    
-    DefinitionFile = os.getcwd() + "\SharedParameterFile.txt"
-    definition_File = app.OpenSharedParameterFile()
+    vec_pile_local = []
+    for i in piles_list:
+        location = i.Location
+        if type(location) == LocationCurve:
+            if location.Curve.Direction.Z > 0:
+                vec_pile_local.append(location.Curve.GetEndPoint(1))
+            if location.Curve.Direction.Z < 0:
+                vec_pile_local.append(location.Curve.GetEndPoint(0))
+        elif type(location) == LocationPoint:
+            top_level = i.get_Parameter(BuiltInParameter.FAMILY_TOP_LEVEL_PARAM).AsDouble() + i.get_Parameter(BuiltInParameter.FAMILY_TOP_LEVEL_OFFSET_PARAM).AsDouble()
+            point = location.Point
+            vec_pile_local.append(location.Point.Add(XYZ(0,0,top_level)))
+    vec_pile_global = []
+    for i in vec_pile_local:
+        vec_StoP = i.Add(survey_vec_negate)
+        x_StoP = vec_StoP.X
+        y_StoP = vec_StoP.Y
+        rotated_vec_StoP = XYZ(x_StoP * math.cos(a0) - y_StoP * math.sin(a0), x_StoP * math.sin(a0) + y_StoP * math.cos(a0), 0)
+        vec = rotated_vec_StoP.Add(vec_survey_global)
+        vec_pile_global.append(vec)
 
-    groups = definition_File.Groups
-    definitions = map(lambda x: x.Definitions, groups)
+    x_guid = System.Guid("b864344b-a63a-4521-be59-8948b2fcb440")
+    y_guid = System.Guid("73e0567a-dce6-45f4-9240-2bb164a59fab")
+    lastEdited_guid = System.Guid("ca4b78ef-f317-469f-947b-ae5b9c5d3237")
     
-    # Create Category Set and Insert Category of Structural Columns to it
-    categories = app.Create.NewCategorySet()
-    category = doc.Settings.Categories.get_Item(BuiltInCategory.OST_StructuralColumns)
-    categories.Insert(category)
-    instanceBinding = app.Create.NewInstanceBinding(categories)
-    bindingMap = doc.ParameterBindings
-    
-    trans = Transaction(doc, "Binding Parameters to Categories")
-    trans.Start()
-    for defis in definitions:
-        for d in defis:
-            bindingMap.Insert(d,instanceBinding, BuiltInParameterGroup.PG_DATA)
-    trans.Commit()
-    
-    x_param_list = map(lambda e: e.LookupParameter("X"), piles_list)
-    y_param_list = map(lambda e: e.LookupParameter("Y"), piles_list)
+    x_param_list = map(lambda e: e.get_Parameter(x_guid), piles_list)
+    y_param_list = map(lambda e: e.get_Parameter(y_guid), piles_list)
+    lastEdited_param_list = map(lambda e: e.get_Parameter(lastEdited_guid), piles_list)
     
     trans = Transaction(doc, "Set X Value")
     trans.Start()
-    for px, py, x, y in zip(x_param_list, y_param_list, x_list, y_list):
-        px.Set(x)
-        py.Set(y)
+    px_error_list = []
+    py_error_list = []
+    lastEdited_error_list = []
+    
+    for px, py, lastEdited, vec in zip(x_param_list, y_param_list, lastEdited_param_list, vec_pile_global):
+        pxOk = px.Set(vec.Y)
+        pyOk = py.Set(vec.X)
+        if not pxOk:
+            px_error_list.append(px)
+        if not pyOk:
+            py_error_list.append(py)
     trans.Commit()
-        
+    if not px_error_list or not py_error_list:
+        TaskDialog.Show("Succeed","Mission's completed!")
 except Exception as error:
     TaskDialog.Show("Error",str(error))
